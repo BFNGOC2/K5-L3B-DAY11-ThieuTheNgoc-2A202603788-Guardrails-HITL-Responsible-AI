@@ -15,6 +15,83 @@ from google.adk.plugins import base_plugin
 from core.utils import chat_with_agent
 
 
+_PII_PATTERNS = (
+    (
+        "phone",
+        re.compile(
+            r"(?<![\w+])(?:\+?84[\s().-]*|0)"
+            r"(?:[\s().-]*\d){9,10}(?![\s().-]*\d)"
+        ),
+    ),
+    (
+        "national_id",
+        re.compile(
+            r"(?<!\d)(?:(?:\d[\s.-]?){8}\d|(?:\d[\s.-]?){11}\d)"
+            r"(?![\s.-]?\d)"
+        ),
+    ),
+    (
+        "email",
+        re.compile(
+            r"(?<![\w.+-])[\w.!#$%&'*+/=?^`{|}~-]+@"
+            r"(?:[\w-]+\.)+[A-Za-z]{2,}(?![\w-])"
+        ),
+    ),
+    (
+        "api_key",
+        re.compile(
+            r"(?P<prefix>\b(?:api[\s_-]*key|access[\s_-]*token|secret[\s_-]*key)"
+            r"\b\s*(?:is\b|[:=：＝])\s*)"
+            r"(?:(?P<quoted>\"[^\"\r\n]+\"|'[^'\r\n]+'|“[^”\r\n]+”|‘[^’\r\n]+’)"
+            r"|(?P<bare>\S+))",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "password",
+        re.compile(
+            r"(?P<prefix>\b(?:admin\s+)?(?:password|passwd|passcode)\b"
+            r"\s*(?:is\b|[:=：＝])\s*)"
+            r"(?:(?P<quoted>\"[^\"\r\n]+\"|'[^'\r\n]+'|“[^”\r\n]+”|‘[^’\r\n]+’)"
+            r"|(?P<bare>\S+))",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "secret",
+        re.compile(
+            r"(?P<prefix>\bsecret\b\s*(?:is\b|[:=：＝])\s*)"
+            r"(?:(?P<quoted>\"[^\"\r\n]+\"|'[^'\r\n]+'|“[^”\r\n]+”|‘[^’\r\n]+’)"
+            r"|(?P<bare>\S+))",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "api_key",
+        re.compile(r"(?<![\w-])sk-\S+", re.IGNORECASE),
+    ),
+    ("password", re.compile(r"\badmin123\b", re.IGNORECASE)),
+    (
+        "internal_host",
+        re.compile(
+            r"\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+internal"
+            r"\b(?::\d{1,5})?",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def _redact_match(match: re.Match[str]) -> str:
+    prefix = match.groupdict().get("prefix") or ""
+    quoted = match.groupdict().get("quoted")
+    if quoted:
+        quote_pair = {'"': '"', "'": "'", "“": "”", "‘": "’"}
+        opening, closing = quoted[0], quote_pair[quoted[0]]
+        return f"{prefix}{opening}[REDACTED]{closing}"
+    return f"{prefix}[REDACTED]"
+
+
 # ============================================================
 # Implement content_filter()
 #
@@ -39,21 +116,10 @@ def content_filter(response: str) -> dict:
     issues = []
     redacted = response
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
-
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
-        if matches:
-            issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+    for name, pattern in _PII_PATTERNS:
+        redacted, count = pattern.subn(_redact_match, redacted)
+        if count:
+            issues.append(f"{name}: {count} found")
 
     return {
         "safe": len(issues) == 0,
@@ -172,16 +238,32 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        result = content_filter(response_text)
+        if result["issues"]:
+            self.redacted_count += 1
+            llm_response.content = types.Content(
+                role=getattr(llm_response.content, "role", None) or "model",
+                parts=[types.Part.from_text(text=result["redacted"])],
+            )
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            judge_result = await llm_safety_check(result["redacted"])
+            if not judge_result["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[
+                        types.Part.from_text(
+                            text=(
+                                "I cannot provide that response. "
+                                "I can help with your banking question."
+                            )
+                        )
+                    ],
+                )
+                return llm_response
+
+        return llm_response if result["issues"] else None
 
 
 # ============================================================

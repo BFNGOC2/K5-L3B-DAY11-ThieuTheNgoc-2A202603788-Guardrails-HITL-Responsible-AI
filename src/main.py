@@ -68,6 +68,10 @@ async def part3_assignment_suite():
         audit, monitor = build_observability()
         pipeline = {"plugins": plugins, "audit": audit, "monitor": monitor}
         result = await run_assignment_suite(pipeline)
+        if result.get("complete") is False:
+            print("Suite incomplete; resume from outputs/results.checkpoint-*.json.")
+            print("See outputs/results.partial.json for sanitized ERROR/NOT_RUN cases.")
+            return result
         print("Suite finished.")
         print("Wrote outputs under repo outputs/")
         return result
@@ -87,17 +91,86 @@ async def part4_attacks():
     print("CHECKPOINT 4: Red + Red Advance")
     print("=" * 60)
 
-    from agents.agent import create_red_agent_default, test_agent
+    from agents.agent import create_red_agent_default
     from agents.guards_agent import create_red_agent_advance
-    from attacks.attacks import run_attacks, save_attack_results
+    from attacks.attacks import (
+        adversarial_prompts,
+        attack_run_fingerprint,
+        attack_checkpoint_provenance,
+        load_completed_attack_results,
+        run_attacks,
+        save_attack_results,
+        write_run_attack_json,
+    )
 
     red_default, red_default_runner = create_red_agent_default()
-    await test_agent(red_default, red_default_runner)
 
     print("\n--- Attacks on Red ---")
     unsafe_results = await run_attacks(
         red_default, red_default_runner, target_name="red_default"
     )
+    red_fingerprint = attack_run_fingerprint("red_default")
+    if any(result.get("layer") == "error" for result in unsafe_results):
+        guards_results = load_completed_attack_results("red_advance")
+        guards_artifact = _SRC_DIR.parent / "outputs" / "guards_attack_result.json"
+        if guards_results or not guards_artifact.exists():
+            write_run_attack_json(guards_results, target_name="red_advance")
+        successful_red_ids = {
+            result["id"]
+            for result in unsafe_results
+            if result.get("layer") != "error"
+        }
+        successful_guard_ids = {
+            result["id"]
+            for result in guards_results
+            if result.get("layer") != "error"
+        }
+        pending_attack_ids = {
+            "red_default": [
+                prompt["id"]
+                for prompt in adversarial_prompts
+                if prompt["id"] not in successful_red_ids
+            ],
+            "red_advance": [
+                prompt["id"]
+                for prompt in adversarial_prompts
+                if prompt["id"] not in successful_guard_ids
+            ],
+        }
+        attempt_errors = [
+            {
+                "target": "red_default",
+                "id": result["id"],
+                "error": result["error"],
+            }
+            for result in unsafe_results
+            if result.get("layer") == "error"
+        ]
+        recovered_from = {}
+        for target in ("red_default", "red_advance"):
+            source = attack_checkpoint_provenance(target)
+            if source:
+                recovered_from[target] = source
+        save_attack_results(
+            unsafe_results=unsafe_results,
+            guards_results=guards_results,
+            run_status="PARTIAL",
+            pending_attack_ids=pending_attack_ids,
+            run_fingerprints={
+                "red_default": red_fingerprint,
+                "red_advance": attack_run_fingerprint("red_advance"),
+            },
+            attempt_errors=attempt_errors,
+            recovered_from=recovered_from,
+        )
+        print(
+            "Red Advance was not rerun because the Red provider request failed; "
+            "matching completed results were resumed if available."
+        )
+        return {
+            "red_default": unsafe_results,
+            "red_advance": guards_results,
+        }
 
     print("\n--- Attacks on Red Advance (bonus B2 tối đa +10 nếu LEAKED; chọn 1) ---")
     red_advance, red_advance_runner = create_red_agent_advance()
@@ -105,10 +178,55 @@ async def part4_attacks():
         red_advance, red_advance_runner, target_name="red_advance"
     )
 
+    successful_red_ids = {
+        result["id"] for result in unsafe_results if result.get("layer") != "error"
+    }
+    successful_guard_ids = {
+        result["id"] for result in guards_results if result.get("layer") != "error"
+    }
+    pending_attack_ids = {
+        "red_default": [
+            prompt["id"]
+            for prompt in adversarial_prompts
+            if prompt["id"] not in successful_red_ids
+        ],
+        "red_advance": [
+            prompt["id"]
+            for prompt in adversarial_prompts
+            if prompt["id"] not in successful_guard_ids
+        ],
+    }
+    attempt_errors = [
+        {
+            "target": target,
+            "id": result["id"],
+            "error": result["error"],
+        }
+        for target, rows in (
+            ("red_default", unsafe_results),
+            ("red_advance", guards_results),
+        )
+        for result in rows
+        if result.get("layer") == "error"
+    ]
+    complete = not any(pending_attack_ids.values())
+    recovered_from = {}
+    for target in ("red_default", "red_advance"):
+        source = attack_checkpoint_provenance(target)
+        if source:
+            recovered_from[target] = source
     save_attack_results(
         unsafe_results=unsafe_results,
         guards_results=guards_results,
         ai_attacks=None,
+        run_status="COMPLETE" if complete else "PARTIAL",
+        pending_attack_ids=pending_attack_ids,
+        run_fingerprints={
+            "red_default": red_fingerprint,
+            "red_advance": attack_run_fingerprint("red_advance"),
+        },
+        attempt_errors=attempt_errors,
+        recovered_from=recovered_from,
     )
 
     red_leaks = sum(1 for r in unsafe_results if r.get("leaked"))
@@ -139,18 +257,40 @@ async def main(parts=None):
     if parts is None:
         parts = [2, 3, 4]  # Core: CP2 → CP3 → CP4
 
+    lab_complete = True
     for part in parts:
         if part == 2:
             await part2_guardrails()
         elif part == 3:
-            await part3_assignment_suite()
+            result = await part3_assignment_suite()
+            if not isinstance(result, dict) or result.get("complete") is False:
+                lab_complete = False
         elif part == 4:
-            await part4_attacks()
+            result = await part4_attacks()
+            from attacks.attacks import adversarial_prompts
+
+            expected = len(adversarial_prompts)
+            red_results = (
+                result.get("red_default", []) if isinstance(result, dict) else []
+            )
+            guards_results = (
+                result.get("red_advance", []) if isinstance(result, dict) else []
+            )
+            if (
+                len(red_results) != expected
+                or len(guards_results) != expected
+                or any(row.get("layer") == "error" for row in red_results)
+                or any(row.get("layer") == "error" for row in guards_results)
+            ):
+                lab_complete = False
         else:
             print(f"Unknown part: {part}. Dùng --part 2, 3, hoặc 4.")
 
     print("\n" + "=" * 60)
-    print("Lab 11 complete! Check your results above.")
+    if lab_complete:
+        print("Lab 11 complete! Check your results above.")
+    else:
+        print("Lab 11 incomplete; one or more requested checkpoints did not complete.")
     print("=" * 60)
 
 

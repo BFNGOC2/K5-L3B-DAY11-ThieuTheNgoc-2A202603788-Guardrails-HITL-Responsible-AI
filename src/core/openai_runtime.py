@@ -8,6 +8,8 @@ Gemini Red Team dùng Google ADK trong agents/*.py — không đi qua file này.
 """
 from __future__ import annotations
 
+import random
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -19,6 +21,12 @@ from core.config import (
     blue_client_kwargs,
     red_openai_client_kwargs,
 )
+
+_BLUE_RETRYABLE_STATUS_CODES = {429, 500, 502, 503}
+_BLUE_MAX_ATTEMPTS = 3
+_BLUE_RETRY_BASE_SECONDS = 0.25
+_BLUE_RETRY_JITTER_SECONDS = 0.1
+_BLUE_REQUEST_TIMEOUT_SECONDS = 60.0
 
 
 @dataclass
@@ -49,20 +57,57 @@ class OpenAIRunner:
     def _client(self):
         from openai import OpenAI
 
-        return OpenAI(**(self.client_kwargs or {}))
+        kwargs = dict(self.client_kwargs or {})
+        if self.provider == "openrouter":
+            # Disable SDK retries so the bounded Blue retry policy owns attempts.
+            kwargs["max_retries"] = 0
+            kwargs.setdefault("timeout", _BLUE_REQUEST_TIMEOUT_SECONDS)
+        return OpenAI(**kwargs)
 
-    async def chat(self, agent: OpenAIAgent, user_message: str) -> str:
+    def _create_completion(self, client, **kwargs):
+        if self.provider != "openrouter":
+            return client.chat.completions.create(**kwargs)
+
+        from openai import APIStatusError, APITimeoutError
+
+        for attempt in range(_BLUE_MAX_ATTEMPTS):
+            try:
+                return client.chat.completions.create(**kwargs)
+            except APITimeoutError:
+                if attempt == _BLUE_MAX_ATTEMPTS - 1:
+                    raise
+            except APIStatusError as exc:
+                if (
+                    exc.status_code not in _BLUE_RETRYABLE_STATUS_CODES
+                    or attempt == _BLUE_MAX_ATTEMPTS - 1
+                ):
+                    raise
+
+            delay = (
+                _BLUE_RETRY_BASE_SECONDS * (2**attempt)
+                + random.uniform(0, _BLUE_RETRY_JITTER_SECONDS)
+            )
+            time.sleep(delay)
+
+    async def chat(
+        self,
+        agent: OpenAIAgent,
+        user_message: str,
+        *,
+        user_id: str = "student",
+    ) -> str:
         for hook in self.input_hooks:
             blocked = hook(user_message)
             if blocked:
                 return blocked
 
-        block_msg = await self._run_input_plugins(user_message)
+        block_msg = await self._run_input_plugins(user_message, user_id=user_id)
         if block_msg is not None:
             return block_msg
 
         client = self._client()
-        completion = client.chat.completions.create(
+        completion = self._create_completion(
+            client,
             model=self.model,
             messages=[
                 {"role": "system", "content": agent.instruction},
@@ -78,7 +123,12 @@ class OpenAIRunner:
         text = await self._run_output_plugins(text)
         return text
 
-    async def _run_input_plugins(self, user_message: str) -> str | None:
+    async def _run_input_plugins(
+        self,
+        user_message: str,
+        *,
+        user_id: str = "student",
+    ) -> str | None:
         if not self.plugins:
             return None
         try:
@@ -90,7 +140,7 @@ class OpenAIRunner:
             role="user",
             parts=[types.Part.from_text(text=user_message)],
         )
-        ctx = _MockInvocationContext()
+        ctx = _MockInvocationContext(user_id=user_id)
         for plugin in self.plugins:
             cb = getattr(plugin, "on_user_message_callback", None)
             if cb is None:
